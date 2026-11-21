@@ -1,5 +1,14 @@
 # Queuezen
 
+<!-- epifive:header -->
+> Plan, approve and publish social media posts on 10 networks from one calendar: a self-hosted alternative to Buffer and Hootsuite.
+
+[![Licence: MIT](https://img.shields.io/badge/licence-MIT-0a7560?style=flat-square)](LICENSE)
+[![Latest release](https://img.shields.io/github/v/release/epifive/queuezen?style=flat-square&label=release&color=4f5bd5)](https://github.com/epifive/queuezen/releases/latest)
+[![GitHub stars](https://img.shields.io/github/stars/epifive/queuezen?style=flat-square&color=b5791b)](https://github.com/epifive/queuezen/stargazers)
+
+**[Docs & guide on epifive.com](https://www.epifive.com/blog/queuezen-open-source-social-media-scheduler?utm_source=github&utm_medium=readme&utm_campaign=queuezen)** · **[Live demo](https://queuezen-demo.vercel.app)** · **[Download the latest release](https://github.com/epifive/queuezen/releases/latest)**
+
 **Open-source social media scheduler — run your own Buffer / Hootsuite-style SaaS.** Plan, approve
 and publish posts on 10 networks from one composer. Built with Next.js 16, React 19 and Tailwind
 CSS 4. Runs on a VPS, Docker, cPanel (Node.js) or Vercel, with MySQL/MariaDB or a zero-setup
@@ -100,3 +109,7 @@ Bug reports and pull requests are welcome — please open an
 ## License
 
 [MIT](LICENSE) © 2026 EpiFive
+
+---
+
+<p align="center">Made by <b>EpiFive</b> — <a href="https://www.epifive.com/?utm_source=github&utm_medium=readme&utm_campaign=queuezen">www.epifive.com</a> · <a href="https://www.epifive.com/open-source?utm_source=github&utm_medium=readme&utm_campaign=queuezen">more open-source projects</a></p>
