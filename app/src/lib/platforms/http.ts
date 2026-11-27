@@ -115,6 +115,69 @@ function formBody(form: NonNullable<CallOptions["form"]>): string {
   return p.toString();
 }
 
+// ── Network failures ──
+
+/** Low-level details of a failed request (Node's fetch only says "fetch failed"; the reason is in `cause`). */
+export interface NetworkFailure {
+  /** Error code of the innermost cause: ENOTFOUND, EAI_AGAIN, ECONNREFUSED, UND_ERR_CONNECT_TIMEOUT, CERT_HAS_EXPIRED... */
+  code: string;
+  /** System call that failed (getaddrinfo, connect...), when known. */
+  syscall: string;
+  /** Innermost error message, e.g. "connect ETIMEDOUT 157.240.1.1:443". */
+  detail: string;
+  /** The connection never opened, so the request was not sent and can be retried safely. */
+  beforeSend: boolean;
+}
+
+const CONNECT_CODES = new Set(["ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH", "ETIMEDOUT", "EADDRNOTAVAIL", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_CONNECT"]);
+const DNS_CODES = new Set(["ENOTFOUND", "EAI_AGAIN", "EAI_FAIL", "EAI_NODATA", "ENODATA", "ESERVFAIL"]);
+const TLS_CODE = /CERT|SELF_SIGNED|UNABLE_TO_(GET|VERIFY)|ERR_TLS|ERR_SSL|EPROTO/;
+
+/** Walks error.cause (and AggregateError.errors from Happy Eyeballs) down to the most specific reason. */
+export function networkFailure(error: unknown): NetworkFailure {
+  let current: unknown = error;
+  let best: { code: string; syscall: string; message: string } = { code: "", syscall: "", message: error instanceof Error ? error.message : String(error) };
+  for (let depth = 0; current && typeof current === "object" && depth < 6; depth++) {
+    const e = current as { code?: unknown; syscall?: unknown; message?: unknown; cause?: unknown; errors?: unknown };
+    const code = typeof e.code === "string" ? e.code : "";
+    const message = typeof e.message === "string" ? e.message : "";
+    if (code || (message && message !== "fetch failed")) best = { code: code || best.code, syscall: typeof e.syscall === "string" ? e.syscall : best.syscall, message: message || best.message };
+    current = e.cause ?? (Array.isArray(e.errors) && e.errors.length ? e.errors[e.errors.length - 1] : undefined);
+  }
+  const { code, syscall } = best;
+  const beforeSend = DNS_CODES.has(code) || code.startsWith("UND_ERR_CONNECT") || (CONNECT_CODES.has(code) && (syscall === "" || syscall === "connect"));
+  return { code, syscall, detail: best.message, beforeSend };
+}
+
+/** What the operator should check for a failure code (shown in the error and the logs). */
+export function networkHint(code: string): string {
+  if (DNS_CODES.has(code)) return "The server could not resolve the API hostname: check its DNS resolver (and the container's /etc/resolv.conf).";
+  if (code === "UND_ERR_CONNECT_TIMEOUT" || code === "ETIMEDOUT" || code === "ENETUNREACH" || code === "EHOSTUNREACH" || code === "EADDRNOTAVAIL")
+    return "The server could not open a connection: check that outbound HTTPS (TCP 443) is allowed by the host firewall, and if the server has no working IPv6 route set QUEUEZEN_IP_FAMILY=4.";
+  if (code === "ECONNREFUSED") return "The connection was refused: an outbound firewall or proxy is rejecting HTTPS to this host.";
+  if (code === "ECONNRESET" || code === "UND_ERR_SOCKET" || code === "EPIPE") return "The connection was dropped mid-request: often a proxy, firewall or unstable network. Retry; if it repeats, check the host's outbound filtering.";
+  if (TLS_CODE.test(code)) return "TLS certificate check failed: something on the network is intercepting HTTPS. Add its CA with NODE_EXTRA_CA_CERTS, or bypass the interception for Meta and the other API hosts.";
+  if (code === "UND_ERR_HEADERS_TIMEOUT" || code === "UND_ERR_BODY_TIMEOUT") return "The API did not answer in time: retry later.";
+  return "Run `npm run diagnose:network` on the server to test DNS, TCP and TLS to the platform APIs.";
+}
+
+/** "Network error: fetch failed" becomes "Network error reaching graph.facebook.com (ETIMEDOUT): connect ETIMEDOUT 157.240.1.1:443. <hint>". */
+export function networkErrorMessage(url: string, failure: NetworkFailure): string {
+  let host = "";
+  try {
+    host = new URL(url).host;
+  } catch {
+    host = "";
+  }
+  const where = host ? ` reaching ${host}` : "";
+  const code = failure.code ? ` (${failure.code})` : "";
+  const detail = failure.detail && failure.detail !== "fetch failed" ? `: ${failure.detail}` : "";
+  return `Network error${where}${code}${detail}. ${networkHint(failure.code)}`;
+}
+
+/** Waits before retrying a request whose connection never opened (DNS hiccup, connect timeout). */
+const CONNECT_RETRY_DELAYS_MS = [1_000, 3_000];
+
 /** Calls a platform API through ctx.fetch and maps failures to DriverError. Parses JSON when it can. */
 export async function call<T = Record<string, unknown>>(ctx: DriverContext, platform: Platform, url: string, options: CallOptions = {}): Promise<HttpResponse<T>> {
   const headers: Record<string, string> = { Accept: "application/json", ...(options.headers ?? {}) };
@@ -128,15 +191,26 @@ export async function call<T = Record<string, unknown>>(ctx: DriverContext, plat
   }
   if (options.contentLength !== undefined) headers["Content-Length"] = String(options.contentLength);
   const init: RequestInit & { duplex?: "half" } = { method: options.method ?? (body ? "POST" : "GET"), headers, body: body ?? undefined, redirect: options.redirect ?? "follow" };
-  if (body && typeof (body as ReadableStream).getReader === "function") init.duplex = "half";
-  let res: Response;
-  try {
-    res = await ctx.fetch(withQuery(url, options.query), init);
-  } catch (error) {
-    if (error instanceof DriverError) throw error;
-    const msg = error instanceof Error ? error.message : String(error);
-    throw new DriverError(`Network error: ${msg}`, "network", { platform, cause: error });
+  const streamed = Boolean(body && typeof (body as ReadableStream).getReader === "function");
+  if (streamed) init.duplex = "half";
+  const target = withQuery(url, options.query);
+  let res: Response | undefined;
+  for (let attempt = 0; !res; attempt++) {
+    try {
+      res = await ctx.fetch(target, init);
+    } catch (error) {
+      if (error instanceof DriverError) throw error;
+      const failure = networkFailure(error);
+      // Only when the connection never opened (nothing was sent), the body can be sent again and the
+      // failure can be transient (a hostname that does not exist won't start resolving in 3 s).
+      if (failure.beforeSend && failure.code !== "ENOTFOUND" && !streamed && attempt < CONNECT_RETRY_DELAYS_MS.length) {
+        await sleep(ctx, CONNECT_RETRY_DELAYS_MS[attempt]);
+        continue;
+      }
+      throw new DriverError(networkErrorMessage(url, failure), "network", { platform, code: failure.code, cause: error });
+    }
   }
+  if (!res) throw new DriverError("Network error: no response.", "network", { platform });
   const text = await res.text().catch(() => "");
   let data: unknown = null;
   if (text) {

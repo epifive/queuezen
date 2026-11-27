@@ -9,6 +9,7 @@
     "start": "next start",
     "start:server": "node server.js",
     "worker": "node scripts/worker.mjs",
+    "diagnose:network": "node scripts/diagnose-network.mjs",
     "lint": "eslint",
     "typecheck": "tsc --noEmit"
   },

@@ -154,7 +154,62 @@ interface FbPage {
   instagram: { id: string; username: string; name: string; picture: string } | null;
 }
 
-async function fbPages(ctx: DriverContext, platform: Platform, userToken: string): Promise<FbPage[]> {
+/** Permissions the person granted and declined, from /me/permissions (null when the call fails). */
+async function fbPermissions(ctx: DriverContext, platform: Platform, userToken: string): Promise<{ granted: Set<string>; declined: Set<string> } | null> {
+  try {
+    const res = await graph(ctx, platform, `${FB_GRAPH}/me/permissions`, userToken);
+    const granted = new Set<string>();
+    const declined = new Set<string>();
+    for (const raw of Array.isArray(res.data.data) ? res.data.data : []) {
+      const p = asRecord(raw);
+      const name = asString(p.permission);
+      if (!name) continue;
+      if (asString(p.status) === "granted") granted.add(name);
+      else declined.add(name);
+    }
+    return { granted, declined };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Why a Facebook Login returned no Page we can publish to, in words the operator can act on: missing
+ * or declined permissions, Pages where the person's role can't create content, Pages returned without
+ * a Page token, or no Pages at all (none selected in the dialog, or access only through a Business
+ * portfolio without Facebook access to the Page itself).
+ */
+async function noPagesError(ctx: DriverContext, platform: "facebook" | "instagram", userToken: string, all: FbPage[]): Promise<DriverError> {
+  const perms = await fbPermissions(ctx, platform, userToken);
+  const reasons: string[] = [];
+  const needed =
+    platform === "facebook" ? ["pages_show_list", "pages_manage_posts", "pages_read_engagement"] : ["pages_show_list", "pages_read_engagement", "instagram_basic", "instagram_content_publish"];
+  if (perms) {
+    const missing = needed.filter((p) => !perms.granted.has(p));
+    if (missing.length) {
+      const declined = missing.filter((p) => perms.declined.has(p));
+      reasons.push(
+        declined.length
+          ? `These permissions were declined in the Facebook dialog: ${declined.join(", ")}. Reconnect and allow them.`
+          : `Facebook did not grant ${missing.join(", ")}. Check the Facebook Login (for Business) configuration of the app; for Pages of people without a role on the app they need Advanced Access (App Review).`,
+      );
+    }
+  }
+  const names = (list: FbPage[]) => list.map((p) => `"${p.name || p.id}"`).join(", ");
+  const noContent = all.filter((p) => p.id && p.accessToken && p.tasks.length && !p.tasks.includes("CREATE_CONTENT"));
+  if (noContent.length) reasons.push(`This Facebook profile can't create content on ${names(noContent)}: a Page admin must give it Facebook access with the content permission.`);
+  const noToken = all.filter((p) => p.id && !p.accessToken);
+  if (noToken.length) reasons.push(`Facebook returned ${names(noToken)} without a Page token: the profile needs Facebook access to the Page itself, not only through a Business portfolio.`);
+  if (!all.length && !reasons.length) {
+    reasons.push(
+      "Facebook returned no Pages for this profile. Reconnect and select the Pages in the dialog (choose \"Edit previous settings\" if you connected before), and make sure this Facebook profile has Facebook access to the Page (Page settings → Page access); access only through a Business portfolio is not enough.",
+    );
+  }
+  return new DriverError(`No Facebook Page can be connected. ${reasons.join(" ")}`, "validation", { platform, code: "no_pages" });
+}
+
+/** Every Page /me/accounts returns, including ones without a Page token (used to explain an empty result). */
+async function fbPagesAll(ctx: DriverContext, platform: Platform, userToken: string): Promise<FbPage[]> {
   const pages: FbPage[] = [];
   let url: string | null = `${FB_GRAPH}/me/accounts`;
   let query: CallOptions["query"] = {
@@ -180,7 +235,7 @@ async function fbPages(ctx: DriverContext, platform: Platform, userToken: string
     url = next || null;
     query = undefined;
   }
-  return pages.filter((p) => p.id && p.accessToken);
+  return pages;
 }
 
 // ── Facebook Pages driver ──
@@ -223,9 +278,9 @@ export const facebookDriver: PlatformDriver = {
 
   async connectFinish(ctx, input): Promise<ConnectedAccount[]> {
     const user = await fbUserToken(ctx, "facebook", input);
-    const pages = await fbPages(ctx, "facebook", user.token);
-    const usable = pages.filter((p) => !p.tasks.length || p.tasks.includes("CREATE_CONTENT"));
-    if (!usable.length) throw new DriverError("No Facebook Pages were shared, or you can't create content on them. Reconnect and select at least one Page.", "validation", { platform: "facebook", code: "no_pages" });
+    const all = await fbPagesAll(ctx, "facebook", user.token);
+    const usable = all.filter((p) => p.id && p.accessToken && (!p.tasks.length || p.tasks.includes("CREATE_CONTENT")));
+    if (!usable.length) throw await noPagesError(ctx, "facebook", user.token, all);
     return usable.map((p) => ({
       externalId: p.id,
       name: p.name,
@@ -680,7 +735,10 @@ export const instagramDriver: PlatformDriver = {
   },
   async connectFinish(ctx, input) {
     const user = await fbUserToken(ctx, "instagram", input);
-    const pages = await fbPages(ctx, "instagram", user.token);
+    const all = await fbPagesAll(ctx, "instagram", user.token);
+    const pages = all.filter((p) => p.id && p.accessToken);
+    // No usable Page at all: explain that first (the Instagram account is reached through its Page).
+    if (!pages.length) throw await noPagesError(ctx, "instagram", user.token, all);
     const linked = pages.filter((p) => p.instagram);
     if (!linked.length) {
       throw new DriverError("None of the shared Facebook Pages has an Instagram business or creator account linked. Link one in the Page settings, or use Instagram Login.", "validation", { platform: "instagram", code: "no_accounts" });

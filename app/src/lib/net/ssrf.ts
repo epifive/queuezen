@@ -161,13 +161,30 @@ export function guardedLookup(
 ) {
   dns.lookup(hostname, { ...options, all: true, verbatim: true }, (err, addresses) => {
     if (err) return callback(err, []);
-    const list = addresses as dns.LookupAddress[];
-    if (!list.length || list.some((a) => isPrivateAddress(a.address))) {
+    const resolved = addresses as dns.LookupAddress[];
+    if (!resolved.length || resolved.some((a) => isPrivateAddress(a.address))) {
       return callback(Object.assign(new Error("Blocked private address"), { code: "EBLOCKED" }), []);
     }
+    const family = forcedFamily();
+    const list = family ? resolved.filter((a) => a.family === family) : resolved;
+    if (!list.length) {
+      return callback(Object.assign(new Error(`${hostname} has no IPv${family} address (QUEUEZEN_IP_FAMILY=${family})`), { code: "ENOTFOUND", hostname }), []);
+    }
     if (options.all) return callback(null, list);
-    callback(null, list[0].address, list[0].family);
+    // A single address: prefer IPv4, which works on every host (many containers have no IPv6 route).
+    const pick = list.find((a) => a.family === 4) ?? list[0];
+    callback(null, pick.address, pick.family);
   });
+}
+
+/**
+ * QUEUEZEN_IP_FAMILY=4 (or 6) makes outgoing connections use only that address family. Set it to 4
+ * on servers whose IPv6 is missing or broken: connections to IPv6 addresses then fail with
+ * ETIMEDOUT / ENETUNREACH ("fetch failed") even though IPv4 works.
+ */
+function forcedFamily(): 4 | 6 | 0 {
+  const v = process.env.QUEUEZEN_IP_FAMILY?.trim();
+  return v === "4" ? 4 : v === "6" ? 6 : 0;
 }
 
 const agent = new Agent({ connect: { lookup: guardedLookup, timeout: 8_000 }, headersTimeout: 10_000, bodyTimeout: 10_000 });

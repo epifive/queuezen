@@ -349,7 +349,14 @@ export async function savePost(input: SavePostInput): Promise<SavePostResult> {
       };
       let id: number;
       if (existing) {
-        const res = await trx.updateTable("posts").set(values).where("id", "=", existing.id).where("status", "=", existing.status).executeTakeFirst();
+        // A post sent back to draft or to review loses its earlier approval: the new version needs a new decision.
+        const approval = next.post === "draft" || next.post === "pending_approval" ? { approved_by: null, approved_at: null } : {};
+        const res = await trx
+          .updateTable("posts")
+          .set({ ...values, ...approval })
+          .where("id", "=", existing.id)
+          .where("status", "=", existing.status)
+          .executeTakeFirst();
         if (Number(res.numUpdatedRows) !== 1) throw new ConcurrentChange();
         id = existing.id;
       } else {
